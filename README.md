@@ -78,15 +78,20 @@ empty JSON value would.
 {
   imports = [ inputs.peerpatrol.nixosModules.default ];
   services.peerpatrol = {
-    package = inputs.peerpatrol.packages.x86_64-linux.default;
     configFile = ./config.json;
+    # package defaults to the flake's own package (callPackage ./package.nix);
+    # override to pin: package = inputs.peerpatrol.packages.x86_64-linux.default;
   };
 }
 ```
 
-Import on every member with the same `configFile`. The unit runs as
-`DynamicUser` with `cap_net_raw` (for `ping`), holds its working dir in
-`/var/lib/peerpatrol` for the state file, and restarts on failure.
+Import on every member with the same `configFile` (per-host generated configs
+are deliberately absent — [ADR 0003](docs/adr/0003-no-generated-per-host-config.md)).
+The unit runs as `DynamicUser` with only `CAP_NET_RAW` (for `ping`) in its
+capability set, a full standard hardening block (`NoNewPrivileges`,
+`ProtectSystem=strict`, `PrivateTmp`, `ProtectKernel*`, `MemoryDenyWriteExecute`,
+`Restrict*`), cwd `/var/lib/peerpatrol` for the state file, a pinned `iputils`
+`ping` on PATH, and restarts on failure.
 
 Secret files integrate with sops-nix (or similar) via `tokenFile` and
 `chatIdFile` on `services.peerpatrol`: they are passed into the unit through
@@ -112,12 +117,13 @@ additionally needs `CAP_NET_RAW` when unprivileged.
 
 ```
 zig build test          # unit tests (scheduler, election, config, alarms)
-nix build -L            # release build (static musl)
-nix flake check -L      # also evaluates the NixOS module and VM config
+nix build -L            # release build (static musl, x86_64 + aarch64)
+nix flake check -L      # also boots the VM test (module, hardening, ping,
+                        # token-file override, telegram-failure tolerance)
 ```
 
 `nix build .#nixosConfigurations.agent-vm-check.config.system.build.vm` boots
-systemd wiring (see commits with `agent-v1:` prefixes).
+the module wiring interactively (see commits with `agent-v1:` prefixes).
 
 ## Design ceilings (accepted, v1)
 
