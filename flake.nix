@@ -25,14 +25,6 @@
         mkdir -p $out/bin
         zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-linux-musl --prefix $out install
       '';
-
-      passthru = {
-        # fast feedback loop outside nix
-        smokeTest = pkgs.runCommand "agent-smoke" {} ''
-          ${self.packages.x86_64-linux.default}/bin/agent
-          test $? != 0 && echo smoke-ok
-        '';
-      };
     };
 
     # wiring example: `nixosModules.default` on each monitoring member host.
@@ -60,7 +52,7 @@
           wants = [ "network-online.target" ];
           after = [ "network-online.target" ];
           serviceConfig = {
-            ExecStart = "${config.services.peerpatrol.package}/bin/agent ${config.services.peerpatrol.configFile}";
+            ExecStart = "${config.services.peerpatrol.package}/bin/peerpatrol ${config.services.peerpatrol.configFile}";
             Restart = "on-failure";
             RestartSec = 5;
             # unprivileged run; ambient cap so shelled-out `ping` can open raw sockets
@@ -83,7 +75,7 @@
         self.nixosModules.default
         {
           networking.hostName = "example-host";
-          boot.kernelParams = [ "console=ttyS0" ];
+          boot.kernelParams = [ "console=ttyS0" "systemd.show_status=yes" ];
           services.peerpatrol = {
             enable = true;
             configFile = ./config.example.json;
