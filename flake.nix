@@ -97,7 +97,12 @@
         self.nixosModules.default
         {
           networking.hostName = "example-host";
+          # minimal bootable disk for qemu; nix flake check evals the
+          # toplevel and asserts these exist
+          fileSystems."/" = { device = "/dev/disk/by-label/nixos"; fsType = "ext4"; };
+          boot.loader.grub.devices = [ "/dev/vda" ];
           boot.kernelParams = [ "console=ttyS0" "systemd.show_status=yes" ];
+          system.stateVersion = "25.05";
           services.peerpatrol = {
             enable = true;
             package = self.packages.x86_64-linux.default;
