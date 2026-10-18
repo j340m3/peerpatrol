@@ -1,2 +1,8 @@
 .opencode/
 node_modules/
+zig-out/
+.zig-cache/
+result*
+
+# NixOS VM artifacts
+*.qcow2

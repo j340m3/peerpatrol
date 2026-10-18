@@ -1,0 +1,12 @@
+{
+  "telegram": {
+    "bot_token": "123456:EXAMPLE-TOKEN-from-BotFather",
+    "chat_id": 123456789
+  },
+  "members": ["example-host", "member-2"],
+  "checks": [
+    { "name": "web", "type": "http", "target": "https://example.com", "expect": 200, "interval_secs": 60 },
+    { "type": "tcp", "target": "gateway.lan:22" },
+    { "type": "ping", "target": "gateway.lan" }
+  ]
+}
