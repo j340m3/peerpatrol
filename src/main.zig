@@ -37,7 +37,17 @@ pub fn main(init: std.process.Init) !void {
     var tg = telegram.Telegram.init(gpa, io, loaded.cnf().telegram.bot_token, loaded.cnf().telegram.chat_id);
     defer tg.client.deinit();
     tg.api_base = loaded.cnf().telegram.api_base;
-    const transport = tg.transport();
+    var state = alarm.FileTransport{
+        .io = io,
+        .gpa = gpa,
+        .path = loaded.cnf().state_path orelse "monitor-state.txt",
+        .inner = tg.transport(),
+    };
+    const transport = state.transport();
+    state.ensureWritable() catch |e| {
+        log("agent: state path {s} not writable: {s}\n", .{ state.path, @errorName(e) });
+        std.process.exit(1);
+    };
 
     const members: []const []const u8 = loaded.cnf().members;
 

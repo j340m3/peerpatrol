@@ -48,6 +48,70 @@ pub const Transport = struct {
     }
 };
 
+/// Alarm state persisted to a local file; every transition is also forwarded
+/// to `inner` (Telegram). The file is authoritative for state, the chat is
+/// the alarm surface. Reads via the same DOWN/UP text format the chat uses.
+/// ponytail ceiling: a host's file can't see other hosts' transitions —
+/// recovery (UP) happens when the DOWN-firing host is checker again, and a
+/// checker change during an outage re-sends DOWN; fixed by peer transport
+/// (a v1 non-goal). 1 MiB state cap: files grow per transition, not per probe.
+pub const FileTransport = struct {
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    path: []const u8,
+    inner: Transport,
+
+    const vtable = Transport.VTable{ .lastState = lastStateFn, .send = sendFn };
+
+    pub fn transport(self: *FileTransport) Transport {
+        return .{ .ctx = self, .vtable = &vtable };
+    }
+
+    /// Fail fast at startup when the state file cannot be rewritten (also
+    /// creates it when missing). Otherwise an unwritable directory defeats the
+    /// local dedup: every failing probe would re-post DOWN to the chat — the
+    /// exact spam mode the ticket-05 smoke saw from the stale pre-fallback
+    /// binary.
+    pub fn ensureWritable(self: *FileTransport) !void {
+        const existing = (try self.readStateFile()) orelse "";
+        defer if (existing.len > 0) self.gpa.free(existing);
+        try std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = self.path, .data = existing });
+    }
+
+    fn readStateFile(f: *FileTransport) !?[]u8 {
+        const data = std.Io.Dir.cwd().readFileAlloc(f.io, f.path, f.gpa, .limited(1 << 20)) catch |e| switch (e) {
+            error.FileNotFound => return null,
+            else => return e,
+        };
+        return data;
+    }
+
+    fn lastStateFn(ctx: *anyopaque, check_id: []const u8) anyerror!?State {
+        const f: *FileTransport = @ptrCast(@alignCast(ctx));
+        const data = (try readStateFile(f)) orelse return null;
+        defer f.gpa.free(data);
+        var last: ?State = null;
+        var lines = std.mem.tokenizeScalar(u8, data, '\n');
+        while (lines.next()) |line| {
+            if (stateFromText(check_id, line)) |s| last = s;
+        }
+        return last;
+    }
+
+    fn sendFn(ctx: *anyopaque, text: []const u8) anyerror!void {
+        const f: *FileTransport = @ptrCast(@alignCast(ctx));
+        const existing = (try readStateFile(f)) orelse "";
+        defer if (existing.len > 0) f.gpa.free(existing);
+        const wbuf = try f.gpa.alloc(u8, existing.len + text.len + 1);
+        defer f.gpa.free(wbuf);
+        @memcpy(wbuf[0..existing.len], existing);
+        @memcpy(wbuf[existing.len..][0..text.len], text);
+        wbuf[existing.len + text.len] = '\n';
+        try std.Io.Dir.cwd().writeFile(f.io, .{ .sub_path = f.path, .data = wbuf[0 .. existing.len + text.len + 1] });
+        try f.inner.send(text);
+    }
+};
+
 /// One alarm-transition decision and (maybe) one message, per probe result.
 pub fn handleResult(t: Transport, check_id: []const u8, bucket: u64, result: probe.Result) !Action {
     const last = try t.lastState(check_id);
@@ -148,4 +212,61 @@ test "stateFromText word boundaries and misspellings" {
     try std.testing.expectEqual(@as(?State, null), stateFromText("web", "DOWN webfoo"));
     try std.testing.expectEqual(@as(?State, null), stateFromText("web", "web is down"));
     try std.testing.expectEqual(@as(?State, null), stateFromText("other", "DOWN web @bucket 3"));
+}
+
+test "FileTransport round-trips state and forwards to chat" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // tmpDir's dirs are relative to its own cwd; resolve the real path so the
+    // FileTransport (Dir.cwd()) reaches the file regardless of the exe cwd.
+    var realpathbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const real_len = try tmp.dir.realPath(io, &realpathbuf);
+    var pathbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&pathbuf, "{s}/state.txt", .{realpathbuf[0..real_len]});
+
+    var fake = Fake.init(gpa);
+    defer fake.deinit();
+
+    var ft = FileTransport{ .io = io, .gpa = gpa, .path = path, .inner = fake.transport() };
+
+    try std.testing.expectEqual(@as(?State, null), try ft.transport().lastState("web"));
+    try std.testing.expectEqual(Action.send_down, try handleResult(ft.transport(), "web", 7, .fail));
+    try std.testing.expectEqual(@as(?State, .down), try ft.transport().lastState("web"));
+    try std.testing.expectEqual(@as(usize, 1), fake.history.items.len);
+
+    // restart recovery: fresh agent instance, same state file
+    var ft2 = FileTransport{ .io = io, .gpa = gpa, .path = path, .inner = fake.transport() };
+    try std.testing.expectEqual(@as(?State, .down), try ft2.transport().lastState("web"));
+    try std.testing.expectEqual(@as(?State, null), try ft2.transport().lastState("other"));
+
+    // recovery closes the alarm in file and chat
+    try std.testing.expectEqual(Action.send_up, try handleResult(ft2.transport(), "web", 8, .ok));
+    try std.testing.expectEqual(@as(?State, .up), try ft2.transport().lastState("web"));
+    try std.testing.expectEqual(@as(usize, 2), fake.history.items.len);
+    try std.testing.expectEqualStrings("UP web", fake.history.items[1]);
+}
+
+test "ensureWritable creates missing file and fails on a bad path" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var realpathbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const real_len = try tmp.dir.realPath(io, &realpathbuf);
+    var pathbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&pathbuf, "{s}/state.txt", .{realpathbuf[0..real_len]});
+
+    var fake = Fake.init(gpa);
+    defer fake.deinit();
+    var ft = FileTransport{ .io = io, .gpa = gpa, .path = path, .inner = fake.transport() };
+    try ft.ensureWritable();
+    const data = (try ft.readStateFile()).?;
+    defer gpa.free(data);
+    try std.testing.expectEqualStrings("", data);
+    try std.testing.expectEqual(@as(usize, 0), fake.history.items.len);
+
+    var bad = FileTransport{ .io = io, .gpa = gpa, .path = "/nonexistent-dir/state.txt", .inner = fake.transport() };
+    try std.testing.expectError(error.FileNotFound, bad.ensureWritable());
 }

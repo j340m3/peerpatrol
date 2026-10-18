@@ -28,6 +28,9 @@ pub const Config = struct {
     telegram: Telegram,
     members: [][]const u8,
     checks: []Check,
+    /// Local file that remembers this host's alarm transitions (default
+    /// "monitor-state.txt" next to the working directory).
+    state_path: ?[]const u8 = null,
 };
 
 pub const Loaded = struct {
