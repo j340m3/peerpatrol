@@ -1,6 +1,6 @@
-# Spec: agent-v1 — decentralized monitoring agent
+# Spec: agent-v1 — peerpatrol
 
-A Zig executable runs on every host. Each host checks other hosts on a schedule decided purely by hashing — no central server, no peer traffic in v1. Failures surface as Telegram messages. Vocabulary: [GLOSSARY.md](../../GLOSSARY.md).
+A Zig executable, **peerpatrol**, runs on every host. Each host checks other hosts on a schedule decided purely by hashing — no central server, no peer traffic in v1. Failures surface as Telegram messages. Vocabulary: [GLOSSARY.md](../../GLOSSARY.md).
 
 ## Runtime
 

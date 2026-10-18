@@ -1,12 +1,12 @@
 # Standalone systemd template for hosts outside this flake (e.g. distros).
 # Adjust ExecStart paths; place the shared JSON config where both sides agree.
 [Unit]
-Description=decentralized-monitoring agent (peer checks, Telegram alarms)
+Description=peerpatrol (peer checks, Telegram alarms)
 Wants=network-online.target
 After=network-online.target
 
 [Service]
-ExecStart=/usr/local/bin/agent /etc/decentralized-monitoring/config.json
+ExecStart=/usr/local/bin/peerpatrol /etc/peerpatrol/config.json
 Restart=on-failure
 RestartSec=5
 # unprivileged run; ambient cap so shelled-out `ping` can open raw sockets
@@ -14,7 +14,7 @@ DynamicUser=yes
 AmbientCapabilities=CAP_NET_RAW
 # writable cwd for the agent's default state_path (`monitor-state.txt`);
 # systemd makes the state dir the working directory when WorkingDirectory is unset
-StateDirectory=monitor-agent
+StateDirectory=peerpatrol
 
 [Install]
 WantedBy=multi-user.target

@@ -9,7 +9,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    b.installArtifact(b.addExecutable(.{ .name = "agent", .root_module = mod }));
+    b.installArtifact(b.addExecutable(.{ .name = "peerpatrol", .root_module = mod }));
 
     const test_mod = b.createModule(.{
         .root_source_file = b.path("src/all_tests.zig"),

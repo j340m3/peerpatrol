@@ -18,17 +18,17 @@ pub fn main(init: std.process.Init) !void {
     const hostname = try std.posix.gethostname(&hostname_buf);
 
     const text = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(max_config_bytes)) catch |e| {
-        std.debug.print("agent: cannot read config {s}: {s}\n", .{ path, @errorName(e) });
+        std.debug.print("peerpatrol: cannot read config {s}: {s}\n", .{ path, @errorName(e) });
         std.process.exit(1);
     };
     defer gpa.free(text);
     var loaded = config.load(gpa, text, hostname) catch |e| {
-        std.debug.print("agent: bad config {s}: {s}\n", .{ path, @errorName(e) });
+        std.debug.print("peerpatrol: bad config {s}: {s}\n", .{ path, @errorName(e) });
         std.process.exit(1);
     };
     defer loaded.deinit();
 
-    log("agent up: self={s} members={d} checks={d}\n", .{
+    log("peerpatrol up: self={s} members={d} checks={d}\n", .{
         loaded.cnf().members[loaded.self_index],
         loaded.cnf().members.len,
         loaded.cnf().checks.len,
@@ -45,7 +45,7 @@ pub fn main(init: std.process.Init) !void {
     };
     const transport = state.transport();
     state.ensureWritable() catch |e| {
-        log("agent: state path {s} not writable: {s}\n", .{ state.path, @errorName(e) });
+        log("peerpatrol: state path {s} not writable: {s}\n", .{ state.path, @errorName(e) });
         std.process.exit(1);
     };
 
