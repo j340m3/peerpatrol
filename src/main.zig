@@ -12,7 +12,29 @@ pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
 
     const argv = init.minimal.args.vector;
-    const path = if (argv.len > 1) std.mem.sliceTo(argv[1], 0) else "config.json";
+    var positional: ?[]const u8 = null;
+    var secret_files: config.SecretFiles = .{};
+    var ai: usize = 1;
+    while (ai < argv.len) : (ai += 1) {
+        const arg = std.mem.sliceTo(argv[ai], 0);
+        if (std.mem.eql(u8, arg, "--token-file") or std.mem.eql(u8, arg, "--chat-id-file")) {
+            ai += 1;
+            if (ai >= argv.len) usageExit("flag needs a path");
+            const value = std.mem.sliceTo(argv[ai], 0);
+            if (std.mem.eql(u8, arg, "--token-file")) {
+                secret_files.token_file = value;
+            } else {
+                secret_files.chat_id_file = value;
+            }
+        } else if (std.mem.startsWith(u8, arg, "--")) {
+            usageExit("unknown flag");
+        } else if (positional == null) {
+            positional = arg;
+        } else {
+            usageExit("unexpected extra argument");
+        }
+    }
+    const path = positional orelse "config.json";
 
     var hostname_buf: [std.posix.HOST_NAME_MAX]u8 = undefined;
     const hostname = try std.posix.gethostname(&hostname_buf);
@@ -22,7 +44,7 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(1);
     };
     defer gpa.free(text);
-    var loaded = config.load(gpa, text, hostname) catch |e| {
+    var loaded = config.load(gpa, io, text, hostname, secret_files) catch |e| {
         std.debug.print("peerpatrol: bad config {s}: {s}\n", .{ path, @errorName(e) });
         std.process.exit(1);
     };
@@ -79,6 +101,12 @@ pub fn main(init: std.process.Init) !void {
             s.bump(woke);
         }
     }
+}
+
+fn usageExit(what: []const u8) noreturn {
+    std.debug.print("peerpatrol: usage: peerpatrol [config-path] [--token-file <path>] [--chat-id-file <path>]\n", .{});
+    std.debug.print("peerpatrol: {s}\n", .{what});
+    std.process.exit(1);
 }
 
 fn nowSecs(io: std.Io) u64 {
