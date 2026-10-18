@@ -3,6 +3,14 @@ const std = @import("std");
 pub const DEFAULT_INTERVAL_SECS: u64 = 60;
 pub const DEFAULT_HTTP_EXPECT: u16 = 200;
 
+/// Optional paths to files holding the telegram credentials; their contents
+/// override the JSON values before validation (so an empty token file fails
+/// like an empty token would).
+pub const SecretFiles = struct {
+    token_file: ?[]const u8 = null,
+    chat_id_file: ?[]const u8 = null,
+};
+
 pub const Telegram = struct {
     bot_token: []const u8,
     chat_id: i64,
@@ -53,14 +61,37 @@ fn strLess(_: void, a: []const u8, b: []const u8) bool {
     return std.mem.order(u8, a, b) == .lt;
 }
 
+/// Read a small secret file and strip the whitespace editors and sops
+/// decryption habitually leave behind.
+fn readTrimmed(arena: std.mem.Allocator, io: std.Io, path: []const u8) ![]const u8 {
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(4096));
+    return std.mem.trim(u8, bytes, " \n\r\t");
+}
+
+/// Apply secret-file texts over the parsed JSON values; pure so the
+/// semantics are testable without touching the filesystem.
+fn applySecrets(arena: std.mem.Allocator, cnf: *Config, token_text: []const u8, chat_id_text: ?[]const u8) !void {
+    cnf.telegram.bot_token = try arena.dupe(u8, std.mem.trim(u8, token_text, " \n\r\t"));
+    if (chat_id_text) |t| {
+        const trimmed = std.mem.trim(u8, t, " \n\r\t");
+        cnf.telegram.chat_id = std.fmt.parseInt(i64, trimmed, 10) catch return error.ChatIdNotInt;
+    }
+}
+
 /// Parse and normalize: derive check ids, defaults, tcp host/port split,
 /// sort members, and locate this host. Errors on missing ("agents error out
 /// when self not in members" per spec) or ambiguous hostname matches.
-pub fn load(gpa: std.mem.Allocator, text: []const u8, hostname: []const u8) !Loaded {
-    const parsed = try std.json.parseFromSlice(Config, gpa, text, .{});
+pub fn load(gpa: std.mem.Allocator, io: std.Io, text: []const u8, hostname: []const u8, secret_files: SecretFiles) !Loaded {
+    var parsed = try std.json.parseFromSlice(Config, gpa, text, .{});
     errdefer parsed.deinit();
-    const cnf = &parsed.value;
+    const cnf: *Config = &parsed.value;
     const arena = parsed.arena.allocator();
+
+    if (secret_files.token_file != null or secret_files.chat_id_file != null) {
+        const token_text = if (secret_files.token_file) |p| try readTrimmed(arena, io, p) else cnf.telegram.bot_token;
+        const chat_id_text = if (secret_files.chat_id_file) |p| try readTrimmed(arena, io, p) else null;
+        try applySecrets(arena, cnf, token_text, chat_id_text);
+    }
 
     if (cnf.telegram.bot_token.len == 0) return error.EmptyBotToken;
     if (cnf.members.len == 0) return error.NoMembers;
@@ -127,7 +158,7 @@ const bad_type_cfg =
 ;
 
 test "load derives ids, defaults, sorts members, locates self" {
-    var l = try load(testing.allocator, sample_cfg, "alpha");
+    var l = try load(testing.allocator, testing.io, sample_cfg, "alpha", .{});
     defer l.deinit();
     const cnf = l.cnf();
     try testing.expectEqualStrings("web", cnf.checks[0].id);
@@ -146,11 +177,30 @@ test "load derives ids, defaults, sorts members, locates self" {
 
 test "load rejects missing/ambiguous self, bad tcp target, unknown type" {
     // not in members at all
-    try testing.expectError(error.MemberSelfMismatch, load(testing.allocator, sample_cfg, "gamma"));
+    try testing.expectError(error.MemberSelfMismatch, load(testing.allocator, testing.io, sample_cfg, "gamma", .{}));
     // hostname "zeta" appears twice: ambiguous
-    try testing.expectError(error.MemberSelfMismatch, load(testing.allocator, dup_cfg, "zeta"));
+    try testing.expectError(error.MemberSelfMismatch, load(testing.allocator, testing.io, dup_cfg, "zeta", .{}));
     // tcp target without port
-    try testing.expectError(error.TcpTargetNoPort, load(testing.allocator, bad_tcp_cfg, "a"));
+    try testing.expectError(error.TcpTargetNoPort, load(testing.allocator, testing.io, bad_tcp_cfg, "a", .{}));
     // unknown check type
-    try testing.expectError(error.UnknownCheckType, load(testing.allocator, bad_type_cfg, "a"));
+    try testing.expectError(error.UnknownCheckType, load(testing.allocator, testing.io, bad_type_cfg, "a", .{}));
+}
+
+test "applySecrets trims and overrides telegram values before validation" {
+    var parsed = try std.json.parseFromSlice(Config, testing.allocator, sample_cfg, .{});
+    defer parsed.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try applySecrets(arena, &parsed.value, "tok-from-file\n", " -1001234567890 \n");
+    try testing.expectEqualStrings("tok-from-file", parsed.value.telegram.bot_token);
+    try testing.expectEqual(@as(i64, -1001234567890), parsed.value.telegram.chat_id);
+}
+
+test "applySecrets rejects non-integer chat id" {
+    var parsed = try std.json.parseFromSlice(Config, testing.allocator, sample_cfg, .{});
+    defer parsed.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    try testing.expectError(error.ChatIdNotInt, applySecrets(arena_state.allocator(), &parsed.value, "tok", "not-a-number"));
 }
