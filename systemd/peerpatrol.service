@@ -7,6 +7,8 @@ After=network-online.target
 
 [Service]
 ExecStart=/usr/local/bin/peerpatrol /etc/peerpatrol/config.json
+# For root-readable secret files (e.g. sops-nix): declare LoadCredential=peerpatrol-token-file:<path>
+# and append "--token-file %d/peerpatrol-token-file --chat-id-file %d/peerpatrol-chat-id-file" to ExecStart.
 Restart=on-failure
 RestartSec=5
 # unprivileged run; ambient cap so shelled-out `ping` can open raw sockets
