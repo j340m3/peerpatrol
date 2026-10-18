@@ -6,3 +6,12 @@ result*
 
 # NixOS VM artifacts
 *.qcow2
+
+# agent tooling: kept locally, not shipped
+.agents/
+AGENTS.md
+.scratch/
+docs/agents/
+opencode.json
+skills-lock.json
+$TMPDIR/
