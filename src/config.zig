@@ -18,6 +18,13 @@ pub const Telegram = struct {
     api_base: []const u8 = "https://api.telegram.org",
 };
 
+pub const Ntfy = struct {
+    /// Self-hosted servers welcome; bare ntfy.sh by default.
+    server: []const u8 = "https://ntfy.sh",
+    /// ntfy.sh topic charset [-_A-Za-z0-9], max 64 chars.
+    topic: []const u8,
+};
+
 pub const Check = struct {
     /// Optional check name; used in messages and hashes (spec: name or type+target).
     name: ?[]const u8 = null,
@@ -33,7 +40,9 @@ pub const Check = struct {
 };
 
 pub const Config = struct {
-    telegram: Telegram,
+    // Channels: at least one must be set (NoChannel below otherwise).
+    telegram: ?Telegram = null,
+    ntfy: ?Ntfy = null,
     members: [][]const u8,
     checks: []Check,
     /// Local file that remembers this host's alarm transitions (default
@@ -71,10 +80,11 @@ fn readTrimmed(arena: std.mem.Allocator, io: std.Io, path: []const u8) ![]const 
 /// Apply secret-file texts over the parsed JSON values; pure so the
 /// semantics are testable without touching the filesystem.
 fn applySecrets(arena: std.mem.Allocator, cnf: *Config, token_text: []const u8, chat_id_text: ?[]const u8) !void {
-    cnf.telegram.bot_token = try arena.dupe(u8, std.mem.trim(u8, token_text, " \n\r\t"));
+    if (cnf.telegram == null) return error.TelegramNotConfigured;
+    cnf.telegram.?.bot_token = try arena.dupe(u8, std.mem.trim(u8, token_text, " \n\r\t"));
     if (chat_id_text) |t| {
         const trimmed = std.mem.trim(u8, t, " \n\r\t");
-        cnf.telegram.chat_id = std.fmt.parseInt(i64, trimmed, 10) catch return error.ChatIdNotInt;
+        cnf.telegram.?.chat_id = std.fmt.parseInt(i64, trimmed, 10) catch return error.ChatIdNotInt;
     }
 }
 
@@ -88,12 +98,23 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, text: []const u8, hostname: []co
     const arena = parsed.arena.allocator();
 
     if (secret_files.token_file != null or secret_files.chat_id_file != null) {
-        const token_text = if (secret_files.token_file) |p| try readTrimmed(arena, io, p) else cnf.telegram.bot_token;
+        const token_text = if (secret_files.token_file) |p|
+            try readTrimmed(arena, io, p)
+        else if (cnf.telegram) |tg| tg.bot_token else "";
         const chat_id_text = if (secret_files.chat_id_file) |p| try readTrimmed(arena, io, p) else null;
         try applySecrets(arena, cnf, token_text, chat_id_text);
     }
 
-    if (cnf.telegram.bot_token.len == 0) return error.EmptyBotToken;
+    if (cnf.telegram != null and cnf.telegram.?.bot_token.len == 0) return error.EmptyBotToken;
+    if (cnf.ntfy) |n| {
+        if (n.topic.len == 0) return error.EmptyNtfyTopic;
+        if (n.topic.len > 64) return error.NtfyTopicTooLong;
+        for (n.topic) |c| {
+            const ok = std.ascii.isAlphanumeric(c) or c == '-' or c == '_';
+            if (!ok) return error.NtfyTopicBadChar;
+        }
+    }
+    if (cnf.telegram == null and cnf.ntfy == null) return error.NoChannel;
     if (cnf.members.len == 0) return error.NoMembers;
 
     for (cnf.checks) |*c| {
@@ -107,6 +128,11 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, text: []const u8, hostname: []co
         } else if (!std.mem.eql(u8, c.@"type", "ping")) {
             return error.UnknownCheckType;
         }
+        // check ids land in message titles and hash strings; a control
+        // character there would inject into ntfy's X-Title header
+        if (c.name) |nm| for (nm) |ch| {
+            if (ch < 0x20 or ch == 0x7f) return error.CheckNameControlChar;
+        };
         c.id = if (c.name) |n| n else try std.fmt.allocPrint(arena, "{s}:{s}", .{ c.@"type", c.target });
     }
 
@@ -136,6 +162,43 @@ const sample_cfg =
     \\    { "type": "tcp", "target": "gateway.lan:22" },
     \\    { "type": "ping", "target": "gateway.lan" }
     \\  ]
+    \\}
+;
+
+const ntfy_only_cfg =
+    \\{
+    \\  "ntfy": { "server": "https://alerts.example.com", "topic": "peerpatrol" },
+    \\  "members": ["alpha"],
+    \\  "checks": [{ "type": "ping", "target": "gateway.lan" }]
+    \\}
+;
+
+const both_cfg =
+    \\{
+    \\  "telegram": { "bot_token": "tok", "chat_id": 123 },
+    \\  "ntfy": { "topic": "peerpatrol" },
+    \\  "members": ["alpha"],
+    \\  "checks": [{ "type": "ping", "target": "gateway.lan" }]
+    \\}
+;
+
+const no_channel_cfg =
+    \\{ "members": ["alpha"], "checks": [{ "type": "ping", "target": "gateway.lan" }] }
+;
+
+const empty_topic_cfg =
+    \\{
+    \\  "ntfy": { "topic": "" },
+    \\  "members": ["alpha"],
+    \\  "checks": [{ "type": "ping", "target": "gateway.lan" }]
+    \\}
+;
+
+const bad_char_topic_cfg =
+    \\{
+    \\  "ntfy": { "topic": "peer/patrol" },
+    \\  "members": ["alpha"],
+    \\  "checks": [{ "type": "ping", "target": "gateway.lan" }]
     \\}
 ;
 
@@ -186,6 +249,50 @@ test "load rejects missing/ambiguous self, bad tcp target, unknown type" {
     try testing.expectError(error.UnknownCheckType, load(testing.allocator, testing.io, bad_type_cfg, "a", .{}));
 }
 
+test "load accepts ntfy-only and both channels" {
+    {
+        var l = try load(testing.allocator, testing.io, ntfy_only_cfg, "alpha", .{});
+        defer l.deinit();
+        try testing.expect(l.cnf().telegram == null);
+        try testing.expectEqualStrings("https://alerts.example.com", l.cnf().ntfy.?.server);
+    }
+    {
+        var l = try load(testing.allocator, testing.io, both_cfg, "alpha", .{});
+        defer l.deinit();
+        try testing.expect(l.cnf().telegram != null);
+        try testing.expect(l.cnf().ntfy != null);
+        // server default applies
+        try testing.expectEqualStrings("https://ntfy.sh", l.cnf().ntfy.?.server);
+    }
+    // neither channel: rejected
+    try testing.expectError(error.NoChannel, load(testing.allocator, testing.io, no_channel_cfg, "alpha", .{}));
+}
+
+test "load validates ntfy topic" {
+    try testing.expectError(error.EmptyNtfyTopic, load(testing.allocator, testing.io, empty_topic_cfg, "alpha", .{}));
+    try testing.expectError(error.NtfyTopicBadChar, load(testing.allocator, testing.io, bad_char_topic_cfg, "alpha", .{}));
+    // 65-char topic > 64 limit
+    const text = try std.fmt.allocPrint(testing.allocator,
+        \\{{"ntfy":{{"topic":"{s}"}},"members":["alpha"],"checks":[{{"type":"ping","target":"h"}}]}}
+    , .{"a" ** 65});
+    defer testing.allocator.free(text);
+    try testing.expectError(error.NtfyTopicTooLong, load(testing.allocator, testing.io, text, "alpha", .{}));
+}
+
+test "check name control character rejected" {
+    const text =
+        \\{"telegram":{"bot_token":"tok","chat_id":1},"members":["alpha"],"checks":[{"name":"web\rINJECT","type":"ping","target":"h"}]}
+    ;
+    try testing.expectError(error.CheckNameControlChar, load(testing.allocator, testing.io, text, "alpha", .{}));
+}
+
+test "empty bot token rejected when telegram present" {
+    const text =
+        \\{"telegram":{"bot_token":"","chat_id":1},"members":["alpha"],"checks":[{"type":"ping","target":"h"}]}
+    ;
+    try testing.expectError(error.EmptyBotToken, load(testing.allocator, testing.io, text, "alpha", .{}));
+}
+
 test "applySecrets trims and overrides telegram values before validation" {
     var parsed = try std.json.parseFromSlice(Config, testing.allocator, sample_cfg, .{});
     defer parsed.deinit();
@@ -193,8 +300,8 @@ test "applySecrets trims and overrides telegram values before validation" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     try applySecrets(arena, &parsed.value, "tok-from-file\n", " -1001234567890 \n");
-    try testing.expectEqualStrings("tok-from-file", parsed.value.telegram.bot_token);
-    try testing.expectEqual(@as(i64, -1001234567890), parsed.value.telegram.chat_id);
+    try testing.expectEqualStrings("tok-from-file", parsed.value.telegram.?.bot_token);
+    try testing.expectEqual(@as(i64, -1001234567890), parsed.value.telegram.?.chat_id);
 }
 
 test "applySecrets rejects non-integer chat id" {

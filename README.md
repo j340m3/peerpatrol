@@ -4,8 +4,9 @@
 
 Decentralized monitoring for small fleets: every member host checks its peers
 on schedules derived purely from hashing — no central server, no peer
-traffic. When a check fails, exactly one `DOWN` message lands in a shared
-Telegram chat; one `UP` message closes the alarm.
+traffic. When a check fails, exactly one `DOWN` message goes out to every
+configured channel (Telegram chat, ntfy topic, ...); one `UP` message closes
+the alarm.
 
 One static Zig binary, one JSON config shared by all members.
 
@@ -24,9 +25,10 @@ every member is doing nothing except the one member elected as checker:
 3. **Alarms.** The checker of a bucket reports the result. A failed probe
    opens an alarm if the last line for that check in the local state file is
    not `DOWN`: it appends `DOWN <check> @bucket <n>` and sends the same text
-   via the Bot API. A passing probe after a failure sends `UP <check>`.
-   Alarm state lives in a local file (`state_path`), so a restarted host
-   re-derives it without reading Telegram history.
+   to every configured channel. A passing probe after a failure sends
+   `UP <check>`. Alarm state lives in a local file (`state_path`), so a
+   restarted host re-derives it without reading channel history. Channel
+   failures are logged and never block the other channels or the loop.
 4. **Checks.** Three probe types: `http` (status must equal `expect`),
    `tcp` (connect to `host:port`), `ping` (one ICMP echo via the system
    `ping`).
@@ -42,6 +44,7 @@ notifications; check names are only ever inputs to the hash and surfaced in
 ```json
 {
   "telegram": { "bot_token": "123:ABC", "chat_id": 123456789 },
+  "ntfy": { "server": "https://ntfy.sh", "topic": "peerpatrol" },
   "state_path": "monitor-state.txt",
   "members": ["laptop", "nixos-01", "nixos-02"],
   "checks": [
@@ -52,6 +55,11 @@ notifications; check names are only ever inputs to the hash and surfaced in
 }
 ```
 
+- `telegram` and `ntfy` — channels; at least one must be configured, and
+  when both are, every alarm goes to both. `ntfy` posts the alarm line as
+  the body with a `DOWN/UP <check>` title, high priority on `DOWN`, low on
+  `UP` (ntfy.sh topic charset `[-_A-Za-z0-9]`, max 64 chars; `server`
+  defaults to `https://ntfy.sh` for self-hosted use).
 - `members` — plain hostnames, sorted by the agent. The host running the
   agent must appear exactly once (`members[] == hostname`), or the agent
   refuses to start.
@@ -110,8 +118,9 @@ zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-linux-musl --prefix out install
 out/bin/peerpatrol config.json
 ```
 
-Outbound HTTPS to the Bot API is the only network requirement; `ping`
-additionally needs `CAP_NET_RAW` when unprivileged.
+Outbound HTTPS to the configured channels (Bot API / ntfy topic) is the only
+network requirement; `ping` additionally needs `CAP_NET_RAW` when
+unprivileged.
 
 ## Development
 

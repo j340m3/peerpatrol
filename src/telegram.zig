@@ -57,12 +57,13 @@ pub const Telegram = struct {
         return try std.fmt.bufPrint(buf, "{s}/bot{s}/{s}?{s}", .{ t.api_base, t.token, method, query });
     }
 
-    fn sendFn(ctx: *anyopaque, text: []const u8) anyerror!void {
+    fn sendFn(ctx: *anyopaque, ev: alarm.AlarmEvent) anyerror!void {
         const t: *Telegram = @ptrCast(@alignCast(ctx));
         var buf: [4096]u8 = undefined;
         var w: std.Io.Writer = .fixed(&buf);
         try w.print("chat_id={d}&text=", .{t.chat_id});
-        try encodeQuery(&w, text);
+        var line_buf: [alarm.text_max]u8 = undefined;
+        try encodeQuery(&w, try alarm.renderText(ev, &line_buf));
         const body = try t.fetchBody(try t.apiUrl("sendMessage", w.buffered(), &url_buf));
         defer t.gpa.free(body);
         if (!(try apiOk(t.gpa, body))) return error.TelegramApi;

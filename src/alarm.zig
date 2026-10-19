@@ -13,6 +13,40 @@ pub fn decide(last: ?State, result: probe.Result) Action {
     };
 }
 
+/// Which check produced a result. Built from the config check plus the
+/// elected checker name; carried on every AlarmEvent so each Channel can
+/// say where the failure was seen and who saw it.
+pub const CheckInfo = struct {
+    id: []const u8,
+    /// Check type (e.g. "http") and target, for humans locating the failure.
+    kind: []const u8,
+    target: []const u8,
+    checker: []const u8,
+};
+
+/// One alarm transition, rendered independently by each Channel.
+pub const AlarmEvent = struct {
+    check_id: []const u8,
+    state: State,
+    /// Bucket of the DOWN; unused for UP.
+    bucket: u64,
+    checker: []const u8,
+    kind: []const u8,
+    target: []const u8,
+};
+
+/// Sufficient buffer for alarm.text.
+pub const text_max: usize = 512;
+
+/// The canonical "DOWN web @bucket 7" / "UP web" line: the state-file format
+/// and every channel's body source.
+pub fn renderText(ev: AlarmEvent, buf: []u8) ![]const u8 {
+    return switch (ev.state) {
+        .down => std.fmt.bufPrint(buf, "DOWN {s} @bucket {d}", .{ ev.check_id, ev.bucket }),
+        .up => std.fmt.bufPrint(buf, "UP {s}", .{ev.check_id}),
+    };
+}
+
 /// Parse a chat text like "DOWN web @bucket 12" for a given check id.
 /// Word boundary after the check id prevents "DOWN webfoo" matching "web".
 pub fn stateFromText(check_id: []const u8, text: []const u8) ?State {
@@ -36,21 +70,54 @@ pub const Transport = struct {
 
     pub const VTable = struct {
         lastState: *const fn (ctx: *anyopaque, check_id: []const u8) anyerror!?State,
-        send: *const fn (ctx: *anyopaque, text: []const u8) anyerror!void,
+        send: *const fn (ctx: *anyopaque, ev: AlarmEvent) anyerror!void,
     };
 
     pub fn lastState(t: Transport, check_id: []const u8) anyerror!?State {
         return t.vtable.lastState(t.ctx, check_id);
     }
 
-    pub fn send(t: Transport, text: []const u8) anyerror!void {
-        return t.vtable.send(t.ctx, text);
+    pub fn send(t: Transport, ev: AlarmEvent) anyerror!void {
+        return t.vtable.send(t.ctx, ev);
+    }
+};
+
+/// Fan-out to every configured channel: a failing channel is logged and
+/// never blocks the others or the monitor loop (at least one channel is
+/// configured per validation in config.zig).
+pub const Channels = struct {
+    telegram: ?Transport = null,
+    ntfy: ?Transport = null,
+
+    const vtable = Transport.VTable{ .lastState = lastStateFn, .send = sendFn };
+
+    pub fn transport(self: *Channels) Transport {
+        return .{ .ctx = self, .vtable = &vtable };
+    }
+
+    fn lastStateFn(ctx: *anyopaque, check_id: []const u8) anyerror!?State {
+        const c: *Channels = @ptrCast(@alignCast(ctx));
+        for ([_]?Transport{ c.telegram, c.ntfy }) |ch| {
+            if (ch) |t| if (t.lastState(check_id) catch null) |s| return s;
+        }
+        return null;
+    }
+
+    fn sendFn(ctx: *anyopaque, ev: AlarmEvent) anyerror!void {
+        const c: *Channels = @ptrCast(@alignCast(ctx));
+        if (c.telegram) |t| t.send(ev) catch |e| logFail("telegram", e);
+        if (c.ntfy) |t| t.send(ev) catch |e| logFail("ntfy", e);
+    }
+
+    fn logFail(name: []const u8, e: anyerror) void {
+        std.debug.print("peerpatrol: {s} send failed: {s}\n", .{ name, @errorName(e) });
     }
 };
 
 /// Alarm state persisted to a local file; every transition is also forwarded
-/// to `inner` (Telegram). The file is authoritative for state, the chat is
-/// the alarm surface. Reads via the same DOWN/UP text format the chat uses.
+/// to `inner` (the configured Channels). The file is authoritative for state,
+/// the channels are the alarm surface. Reads via the same DOWN/UP text format
+/// the channels use.
 /// ponytail ceiling: a host's file can't see other hosts' transitions —
 /// recovery (UP) happens when the DOWN-firing host is checker again, and a
 /// checker change during an outage re-sends DOWN; fixed by peer transport
@@ -98,43 +165,48 @@ pub const FileTransport = struct {
         return last;
     }
 
-    fn sendFn(ctx: *anyopaque, text: []const u8) anyerror!void {
+    fn sendFn(ctx: *anyopaque, ev: AlarmEvent) anyerror!void {
         const f: *FileTransport = @ptrCast(@alignCast(ctx));
+        var buf: [text_max]u8 = undefined;
+        const rendered = try renderText(ev, &buf);
         const existing = (try readStateFile(f)) orelse "";
         defer if (existing.len > 0) f.gpa.free(existing);
-        const wbuf = try f.gpa.alloc(u8, existing.len + text.len + 1);
+        const wbuf = try f.gpa.alloc(u8, existing.len + rendered.len + 1);
         defer f.gpa.free(wbuf);
         @memcpy(wbuf[0..existing.len], existing);
-        @memcpy(wbuf[existing.len..][0..text.len], text);
-        wbuf[existing.len + text.len] = '\n';
-        try std.Io.Dir.cwd().writeFile(f.io, .{ .sub_path = f.path, .data = wbuf[0 .. existing.len + text.len + 1] });
-        try f.inner.send(text);
+        @memcpy(wbuf[existing.len..][0..rendered.len], rendered);
+        wbuf[existing.len + rendered.len] = '\n';
+        try std.Io.Dir.cwd().writeFile(f.io, .{ .sub_path = f.path, .data = wbuf[0 .. existing.len + rendered.len + 1] });
+        try f.inner.send(ev);
     }
 };
 
-/// One alarm-transition decision and (maybe) one message, per probe result.
-pub fn handleResult(t: Transport, check_id: []const u8, bucket: u64, result: probe.Result) !Action {
-    const last = try t.lastState(check_id);
-    switch (decide(last, result)) {
-        .silent => return .silent,
-        .send_down => {
-            var buf: [512]u8 = undefined;
-            const text = try std.fmt.bufPrint(&buf, "DOWN {s} @bucket {d}", .{ check_id, bucket });
-            try t.send(text);
-            return .send_down;
-        },
-        .send_up => {
-            var buf: [512]u8 = undefined;
-            const text = try std.fmt.bufPrint(&buf, "UP {s}", .{check_id});
-            try t.send(text);
-            return .send_up;
-        },
-    }
+/// One alarm-transition decision and (maybe) one event, per probe result.
+/// Null means silent: nothing was sent anywhere.
+pub fn handleResult(t: Transport, ci: CheckInfo, bucket: u64, result: probe.Result) !?AlarmEvent {
+    const last = try t.lastState(ci.id);
+    const state: State = switch (decide(last, result)) {
+        .silent => return null,
+        .send_down => .down,
+        .send_up => .up,
+    };
+    const ev = AlarmEvent{
+        .check_id = ci.id,
+        .state = state,
+        .bucket = bucket,
+        .checker = ci.checker,
+        .kind = ci.kind,
+        .target = ci.target,
+    };
+    try t.send(ev);
+    return ev;
 }
 
 const Fake = struct {
     gpa: std.mem.Allocator,
     history: std.ArrayList([]u8),
+    /// When true, send always fails (best-effort fan-out testing).
+    fail: bool = false,
 
     fn init(gpa: std.mem.Allocator) Fake {
         return .{ .gpa = gpa, .history = .empty };
@@ -159,32 +231,48 @@ const Fake = struct {
         }
         return null;
     }
-    fn sendFn(ctx: *anyopaque, text: []const u8) anyerror!void {
+    fn sendFn(ctx: *anyopaque, ev: AlarmEvent) anyerror!void {
         const f: *Fake = @ptrCast(@alignCast(ctx));
-        try f.history.append(f.gpa, try f.gpa.dupe(u8, text));
+        if (f.fail) return error.SendFailed;
+        var buf: [text_max]u8 = undefined;
+        try f.history.append(f.gpa, try f.gpa.dupe(u8, try renderText(ev, &buf)));
     }
 };
+
+fn webInfo(checker: []const u8) CheckInfo {
+    return .{ .id = "web", .kind = "http", .target = "https://example.com", .checker = checker };
+}
+
+test "renderText renders DOWN and UP lines" {
+    var buf: [text_max]u8 = undefined;
+    const down = try renderText(.{ .check_id = "web", .state = .down, .bucket = 7, .checker = "n1", .kind = "http", .target = "h" }, &buf);
+    try std.testing.expectEqualStrings("DOWN web @bucket 7", down);
+    const up = try renderText(.{ .check_id = "web", .state = .up, .bucket = 9, .checker = "n1", .kind = "http", .target = "h" }, &buf);
+    try std.testing.expectEqualStrings("UP web", up);
+}
 
 test "empty history + ok is silent" {
     var fake = Fake.init(std.testing.allocator);
     defer fake.deinit();
-    const action = try handleResult(fake.transport(), "web", 1, .ok);
-    try std.testing.expectEqual(Action.silent, action);
+    const ev = try handleResult(fake.transport(), webInfo("node1"), 1, .ok);
+    try std.testing.expectEqual(@as(?AlarmEvent, null), ev);
 }
 
 test "fail opens alarm with DOWN message" {
     var fake = Fake.init(std.testing.allocator);
     defer fake.deinit();
-    const action = try handleResult(fake.transport(), "web", 7, .fail);
-    try std.testing.expectEqual(Action.send_down, action);
+    const ev = (try handleResult(fake.transport(), webInfo("node1"), 7, .fail)).?;
+    try std.testing.expectEqual(State.down, ev.state);
+    try std.testing.expectEqual(@as(u64, 7), ev.bucket);
+    try std.testing.expectEqualStrings("node1", ev.checker);
     try std.testing.expectEqualStrings("DOWN web @bucket 7", fake.history.items[0]);
 }
 
 test "fail twice sends one DOWN only" {
     var fake = Fake.init(std.testing.allocator);
     defer fake.deinit();
-    try std.testing.expectEqual(Action.send_down, try handleResult(fake.transport(), "web", 7, .fail));
-    try std.testing.expectEqual(Action.silent, try handleResult(fake.transport(), "web", 8, .fail));
+    try std.testing.expect(try handleResult(fake.transport(), webInfo("n"), 7, .fail) != null);
+    try std.testing.expectEqual(@as(?AlarmEvent, null), try handleResult(fake.transport(), webInfo("n"), 8, .fail));
     try std.testing.expectEqual(@as(usize, 1), fake.history.items.len);
 }
 
@@ -192,8 +280,8 @@ test "down history + ok sends UP" {
     var fake = Fake.init(std.testing.allocator);
     defer fake.deinit();
     try fake.history.append(std.testing.allocator, try std.testing.allocator.dupe(u8, "DOWN web @bucket 3"));
-    const action = try handleResult(fake.transport(), "web", 4, .ok);
-    try std.testing.expectEqual(Action.send_up, action);
+    const ev = (try handleResult(fake.transport(), webInfo("n"), 4, .ok)).?;
+    try std.testing.expectEqual(State.up, ev.state);
     try std.testing.expectEqualStrings("UP web", fake.history.items[1]);
 }
 
@@ -201,8 +289,36 @@ test "up history + ok is silent" {
     var fake = Fake.init(std.testing.allocator);
     defer fake.deinit();
     try fake.history.append(std.testing.allocator, try std.testing.allocator.dupe(u8, "UP web"));
-    const action = try handleResult(fake.transport(), "web", 4, .ok);
-    try std.testing.expectEqual(Action.silent, action);
+    const ev = try handleResult(fake.transport(), webInfo("n"), 4, .ok);
+    try std.testing.expectEqual(@as(?AlarmEvent, null), ev);
+}
+
+test "channels fan out to every configured channel" {
+    var a = Fake.init(std.testing.allocator);
+    defer a.deinit();
+    var b = Fake.init(std.testing.allocator);
+    defer b.deinit();
+    var ch = Channels{ .telegram = a.transport(), .ntfy = b.transport() };
+    const ev = (try handleResult(ch.transport(), webInfo("node1"), 7, .fail)).?;
+    try std.testing.expectEqual(State.down, ev.state);
+    try std.testing.expectEqual(@as(usize, 1), a.history.items.len);
+    try std.testing.expectEqual(@as(usize, 1), b.history.items.len);
+    try std.testing.expectEqualStrings("DOWN web @bucket 7", a.history.items[0]);
+    try std.testing.expectEqualStrings("DOWN web @bucket 7", b.history.items[0]);
+}
+
+test "failing channel never blocks the others" {
+    var bad = Fake.init(std.testing.allocator);
+    defer bad.deinit();
+    bad.fail = true;
+    var ok = Fake.init(std.testing.allocator);
+    defer ok.deinit();
+    var ch = Channels{ .telegram = bad.transport(), .ntfy = ok.transport() };
+    const ev = (try handleResult(ch.transport(), webInfo("n"), 7, .fail)).?;
+    try std.testing.expectEqual(State.down, ev.state);
+    try std.testing.expectEqual(@as(usize, 0), bad.history.items.len);
+    try std.testing.expectEqual(@as(usize, 1), ok.history.items.len);
+    // channel errors are swallowed; no alarm error surfaces below FileTransport
 }
 
 test "stateFromText word boundaries and misspellings" {
@@ -214,7 +330,7 @@ test "stateFromText word boundaries and misspellings" {
     try std.testing.expectEqual(@as(?State, null), stateFromText("other", "DOWN web @bucket 3"));
 }
 
-test "FileTransport round-trips state and forwards to chat" {
+test "FileTransport round-trips state and forwards to channels" {
     const io = std.testing.io;
     const gpa = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -232,7 +348,7 @@ test "FileTransport round-trips state and forwards to chat" {
     var ft = FileTransport{ .io = io, .gpa = gpa, .path = path, .inner = fake.transport() };
 
     try std.testing.expectEqual(@as(?State, null), try ft.transport().lastState("web"));
-    try std.testing.expectEqual(Action.send_down, try handleResult(ft.transport(), "web", 7, .fail));
+    try std.testing.expectEqual(State.down, (try handleResult(ft.transport(), webInfo("node1"), 7, .fail)).?.state);
     try std.testing.expectEqual(@as(?State, .down), try ft.transport().lastState("web"));
     try std.testing.expectEqual(@as(usize, 1), fake.history.items.len);
 
@@ -242,7 +358,7 @@ test "FileTransport round-trips state and forwards to chat" {
     try std.testing.expectEqual(@as(?State, null), try ft2.transport().lastState("other"));
 
     // recovery closes the alarm in file and chat
-    try std.testing.expectEqual(Action.send_up, try handleResult(ft2.transport(), "web", 8, .ok));
+    try std.testing.expectEqual(State.up, (try handleResult(ft2.transport(), webInfo("node1"), 8, .ok)).?.state);
     try std.testing.expectEqual(@as(?State, .up), try ft2.transport().lastState("web"));
     try std.testing.expectEqual(@as(usize, 2), fake.history.items.len);
     try std.testing.expectEqualStrings("UP web", fake.history.items[1]);

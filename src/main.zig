@@ -2,6 +2,7 @@ const std = @import("std");
 const alarm = @import("alarm.zig");
 const config = @import("config.zig");
 const election = @import("election.zig");
+const ntfy = @import("ntfy.zig");
 const probe = @import("probe.zig");
 const telegram = @import("telegram.zig");
 
@@ -56,14 +57,25 @@ pub fn main(init: std.process.Init) !void {
         loaded.cnf().checks.len,
     });
 
-    var tg = telegram.Telegram.init(gpa, io, loaded.cnf().telegram.bot_token, loaded.cnf().telegram.chat_id);
-    defer tg.client.deinit();
-    tg.api_base = loaded.cnf().telegram.api_base;
+    var channels = alarm.Channels{};
+    var tg: ?telegram.Telegram = null;
+    var nfy: ?ntfy.Ntfy = null;
+    if (loaded.cnf().telegram) |t| {
+        tg = telegram.Telegram.init(gpa, io, t.bot_token, t.chat_id);
+        tg.?.api_base = t.api_base;
+        channels.telegram = tg.?.transport();
+    }
+    if (loaded.cnf().ntfy) |n| {
+        nfy = ntfy.Ntfy.init(gpa, io, n.server, n.topic);
+        channels.ntfy = nfy.?.transport();
+    }
+    defer if (tg) |*t| t.client.deinit();
+    defer if (nfy) |*n| n.deinit();
     var state = alarm.FileTransport{
         .io = io,
         .gpa = gpa,
         .path = loaded.cnf().state_path orelse "monitor-state.txt",
-        .inner = tg.transport(),
+        .inner = channels.transport(),
     };
     const transport = state.transport();
     state.ensureWritable() catch |e| {
@@ -146,14 +158,23 @@ const Slot = struct {
             probe.tcpProbe(io, s.check.host, s.check.port)
         else
             probe.pingProbe(gpa, io, s.check.target);
-        const action = alarm.handleResult(transport, s.check.id, bucket, r) catch |e| {
-            log("{s} @bucket {d}: telegram {s}\n", .{ s.check.id, bucket, @errorName(e) });
+        const ev = alarm.handleResult(transport, .{
+            .id = s.check.id,
+            .kind = s.check.@"type",
+            .target = s.check.target,
+            .checker = members[self_index],
+        }, bucket, r) catch |e| {
+            log("{s} @bucket {d}: alarm {s}\n", .{ s.check.id, bucket, @errorName(e) });
             return;
         };
-        switch (action) {
-            .silent => {},
-            .send_down => log("{s} @bucket {d}: DOWN sent (probe fail)\n", .{ s.check.id, bucket }),
-            .send_up => log("{s} @bucket {d}: UP sent (probe ok)\n", .{ s.check.id, bucket }),
+        if (ev) |e| {
+            var buf: [alarm.text_max]u8 = undefined;
+            log("peerpatrol: {s} ({s} {s} checker={s})\n", .{
+                alarm.renderText(e, &buf) catch return,
+                e.kind,
+                e.target,
+                e.checker,
+            });
         }
     }
 };
